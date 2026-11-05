@@ -3,9 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/sendqueue"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -517,4 +520,103 @@ func skippedWaitOutcome(res sendDeliveryResult) string {
 		return outcome
 	}
 	return ""
+}
+
+// queuedCodexNativeTarget is deliberately local to queued busy sends. Global
+// busy capability, synchronous sends, drafts, slash commands and guarded
+// releases retain their existing transport and readiness rules.
+func queuedCodexNativeTarget(inst *session.Instance, rec *sendqueue.Record, status string, peers []*session.Instance) *session.CodexQueueTarget {
+	if status != "running" || rec.RequireInputPrompt || isBareSlashCommand(rec.Message) ||
+		!session.IsCodexCompatible(inst.Tool) || !inst.CodexRolloutIsResolvableLocally() {
+		return nil
+	}
+	value, _ := sendTransportFromConfig()
+	if value != "auto" {
+		return nil
+	}
+	target, err := session.ResolveCodexQueueTarget(inst)
+	if err != nil {
+		return nil
+	}
+	for _, peer := range peers {
+		if peer != nil && peer.ID != inst.ID && peer.CodexRolloutIsResolvableLocally() &&
+			peer.Exists() && peer.LiveCodexUserThreadID() == target.ThreadID {
+			return nil
+		}
+	}
+	return &target
+}
+
+// sendQueuedCodexNative runs only after the durable queue record says typing.
+// Both ownership locks span the reservation and command. The marker survives
+// success (enqueue is pending) and every ambiguous command outcome.
+func sendQueuedCodexNative(inst *session.Instance, rec *sendqueue.Record, target session.CodexQueueTarget, set func(func(*sendqueue.Record)) error) (map[string]interface{}, int) {
+	result := map[string]interface{}{
+		"success": false, "delivery": deliveryAcceptanceRefused,
+		"transport": "codex_queue", "send_id": rec.SendID, "codex_session_id": target.ThreadID,
+		"submitted": false, "confirmation": "unknown", "completion": "pending",
+	}
+	refuse := func(err error) (map[string]interface{}, int) {
+		result["error"] = err.Error()
+		return result, 1
+	}
+	guard, err := acquireCodexAcceptanceGuard(inst, codexAcceptanceLockWait(time.Second))
+	if err != nil {
+		return refuse(err)
+	}
+	defer guard.Release()
+	lock, err := session.AcquireSendLock(inst.ID, sendTargetLockWait)
+	if err != nil {
+		result["delivery"] = deliveryTargetBusy
+		return refuse(err)
+	}
+	defer lock.Release()
+	if err := validateCodexAcceptanceFence(inst, guard.fence); err != nil {
+		return refuse(err)
+	}
+	// Target resolution predates both locks. Exclude input from earlier peer
+	// sends before reserving this attempt, and give the landing scan the same
+	// fresh boundary. Only the cheap stat runs here, not queue --help again.
+	info, err := os.Stat(target.Rollout)
+	if err != nil {
+		return refuse(fmt.Errorf("refresh native queue rollout offset: %w", err))
+	}
+	target.From = info.Size()
+	if err := set(func(r *sendqueue.Record) {
+		r.TranscriptPath, r.TranscriptFrom = target.Rollout, target.From
+		r.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}); err != nil {
+		return refuse(fmt.Errorf("record native queue rollout offset: %w", err))
+	}
+	if err := guard.Prepare(inst.ID, time.Now()); err != nil {
+		return refuse(err)
+	}
+	if err := guard.marker.PrepareQueue(target, rec.Message); err != nil {
+		// No enqueue started. Clear only this reservation.
+		if clearErr := session.ClearCodexSubmissionMarker(guard.marker); clearErr != nil {
+			result["delivery"] = deliveryNoEvidence
+			return refuse(fmt.Errorf("prepare native queue marker: %v; clear reservation: %w", err, clearErr))
+		}
+		return refuse(err)
+	}
+	attempted, enqueueErr := target.Enqueue(rec.Message)
+	if !attempted {
+		if err := session.ClearCodexSubmissionMarker(guard.marker); err != nil {
+			result["delivery"] = deliveryNoEvidence
+			return refuse(err)
+		}
+		result["delivery"] = deliveryTargetBusy
+		return refuse(enqueueErr)
+	}
+	result["delivery"] = "queued_native"
+	if err := guard.RecordTransportOutcome("queued_native", time.Now()); err != nil {
+		result["delivery"] = deliveryNoEvidence
+		return refuse(err)
+	}
+	if enqueueErr != nil {
+		result["delivery"] = deliveryNoEvidence
+		return refuse(enqueueErr)
+	}
+	result["success"] = true
+	return result, 0
 }

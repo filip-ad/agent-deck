@@ -1,6 +1,8 @@
 package session
 
 import (
+	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,10 +11,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/childenv"
 )
 
 const (
@@ -26,7 +31,9 @@ const (
 
 // CodexSubmissionMarker is the content-free durable handoff between
 // cooperating session-send processes. It records only which acceptance fence
-// a send owns; prompts, responses, and their hashes never enter this file.
+// a send owns; prompts and responses never enter this file. Native queue
+// markers also keep a message hash and exact rollout offset to require
+// message-specific uptake.
 type CodexSubmissionMarker struct {
 	Version             int       `json:"version"`
 	InstanceID          string    `json:"instance_id"`
@@ -36,6 +43,9 @@ type CodexSubmissionMarker struct {
 	Phase               string    `json:"phase"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	QueueMessageHash    string    `json:"queue_message_hash,omitempty"`
+	QueueRollout        string    `json:"queue_rollout,omitempty"`
+	QueueFrom           int64     `json:"queue_from,omitempty"`
 }
 
 // PrepareCodexSubmissionMarker durably publishes an unresolved attempt before
@@ -125,6 +135,21 @@ func ReconcileCodexSubmissionMarker(
 	}
 	if marker.InstanceID != strings.TrimSpace(instanceID) || marker.CodexSessionID != strings.TrimSpace(codexSessionID) {
 		return "", fmt.Errorf("Codex submission marker ownership does not match this instance")
+	}
+	if marker.QueueMessageHash != "" {
+		landed, err := codexQueueInputLanded(marker)
+		if err != nil || !landed {
+			path, _ := codexSubmissionMarkerPath(codexSessionID)
+			refusal := fmt.Errorf("unresolved native Codex queue submission %s at %s: matching input is not durable; inspect the exact rollout and native queue before recovery; refusing a second send", marker.AttemptID, path)
+			if err != nil {
+				return "", fmt.Errorf("%w (cannot read queued input: %v)", refusal, err)
+			}
+			return "", refusal
+		}
+		if err := ClearCodexSubmissionMarker(marker); err != nil {
+			return "", err
+		}
+		return currentGeneration, nil
 	}
 	if currentGeneration == marker.PriorTurnGeneration {
 		took, evidenceErr := false, error(nil)
@@ -346,6 +371,12 @@ func validateCodexSubmissionMarker(marker *CodexSubmissionMarker) error {
 	if err := validateCodexMarkerGeneration(marker.CodexSessionID, marker.PriorTurnGeneration, true); err != nil {
 		return err
 	}
+	if marker.QueueMessageHash != "" {
+		digest, err := hex.DecodeString(marker.QueueMessageHash)
+		if err != nil || len(digest) != sha256.Size || !filepath.IsAbs(marker.QueueRollout) || !strings.Contains(filepath.Base(marker.QueueRollout), marker.CodexSessionID) || marker.QueueFrom < 0 {
+			return fmt.Errorf("invalid native Codex queue marker")
+		}
+	}
 	switch marker.Phase {
 	case CodexSubmissionPhasePrepared, CodexSubmissionPhaseSubmitted, codexSubmissionPhaseAmbiguous:
 	default:
@@ -380,4 +411,164 @@ func validatePrivateCodexMarkerPath(info os.FileInfo, wantDir bool) error {
 		return fmt.Errorf("path is not owned by the current user")
 	}
 	return nil
+}
+
+// CodexQueueTarget is a local, pane-owned thread with a supported native queue
+// command. It never uses resume, a model override, or the target's composer.
+type CodexQueueTarget struct {
+	ThreadID, Home, Binary, Rollout string
+	From                            int64
+	instance                        *Instance
+}
+
+func codexQueueCommand(ctx context.Context, target CodexQueueTarget, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, target.Binary, args...)
+	cmd.WaitDelay = time.Second
+	for _, kv := range childenv.ForLaunch("") {
+		if !strings.HasPrefix(kv, "CODEX_HOME=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "CODEX_HOME="+target.Home)
+	return cmd
+}
+
+// ResolveCodexQueueTarget refuses unsupported commands and incomplete ownership
+// before any queue write. The caller keeps the existing idle path on refusal.
+func ResolveCodexQueueTarget(inst *Instance) (CodexQueueTarget, error) {
+	var target CodexQueueTarget
+	if inst == nil || !IsCodexCompatible(inst.Tool) || !inst.CodexRolloutIsResolvableLocally() {
+		return target, fmt.Errorf("native Codex queue needs a local target")
+	}
+	thread := inst.LiveCodexUserThreadID()
+	if thread == "" || thread != inst.CodexSessionID {
+		return target, fmt.Errorf("native Codex queue has no exact pane-owned thread")
+	}
+	// Reuse launch parsing for a bare executable or a CODEX_HOME assignment.
+	// Shell wrappers and extra launch arguments keep the existing idle path.
+	command := inst.resolveCodexCommand(inst.Command)
+	var executable string
+	for command != "" {
+		word, rest, ok := nextShellWord(command)
+		if !ok {
+			return target, fmt.Errorf("native Codex queue command is unsupported")
+		}
+		if isShellEnvAssignment(word) {
+			if !strings.HasPrefix(word, "CODEX_HOME=") {
+				return target, fmt.Errorf("native Codex queue command environment is unsupported")
+			}
+			command = strings.TrimSpace(rest)
+			continue
+		}
+		if strings.TrimSpace(rest) != "" {
+			return target, fmt.Errorf("native Codex queue launch arguments are unsupported")
+		}
+		executable = word
+		break
+	}
+	binary, err := exec.LookPath(executable)
+	if err != nil {
+		return target, fmt.Errorf("resolve native Codex queue command: %w", err)
+	}
+	path, err := inst.codexRolloutPath()
+	if err != nil {
+		return target, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return target, err
+	}
+	target = CodexQueueTarget{ThreadID: thread, Home: ExpandPath(inst.ResolvedCodexHome()), Binary: binary, Rollout: path, From: info.Size(), instance: inst}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := codexQueueCommand(ctx, target, "queue", "--help").Output()
+	if err != nil || !strings.Contains(string(out), "--thread") || !strings.Contains(string(out), "--message") {
+		return CodexQueueTarget{}, fmt.Errorf("native Codex queue command is unsupported")
+	}
+	return target, nil
+}
+
+// Enqueue returns attempted=false only when the child never started. Once it
+// starts, any error is ambiguous: callers must retain the marker and never
+// fall back to keys or retry. Success proves enqueue only.
+func (target CodexQueueTarget) Enqueue(message string) (attempted bool, err error) {
+	if target.instance == nil || target.instance.LiveCodexUserThreadID() != target.ThreadID || target.instance.CodexSessionID != target.ThreadID || ExpandPath(target.instance.ResolvedCodexHome()) != target.Home {
+		return false, fmt.Errorf("native Codex queue target changed before enqueue")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := codexQueueCommand(ctx, target, "queue", "--thread", target.ThreadID, "--message", message)
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("start native Codex queue: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return true, fmt.Errorf("native Codex enqueue outcome is unknown: %w", err)
+	}
+	return true, nil
+}
+
+func codexQueueMessageHash(text string) string {
+	// Native queue input is plain text. Whitespace is part of its identity.
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+// PrepareQueue binds this marker to the exact message and rollout offset before
+// enqueue. Only matching user input can resolve it; another turn cannot.
+func (m *CodexSubmissionMarker) PrepareQueue(target CodexQueueTarget, message string) error {
+	if m == nil || m.CodexSessionID != target.ThreadID {
+		return fmt.Errorf("native Codex queue marker target mismatch")
+	}
+	next := *m
+	next.QueueMessageHash = codexQueueMessageHash(message)
+	next.QueueRollout, next.QueueFrom = target.Rollout, target.From
+	if err := writeCodexSubmissionMarker(&next, false); err != nil {
+		return err
+	}
+	*m = next
+	return nil
+}
+
+// codexQueueInputLanded reads only appended user input in the exact rollout.
+// A completed old turn, unrelated input, or enqueue acknowledgement is no proof.
+func codexQueueInputLanded(m *CodexSubmissionMarker) (bool, error) {
+	f, err := os.Open(m.QueueRollout)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(m.QueueFrom, io.SeekStart); err != nil {
+		return false, err
+	}
+	// Reuse the acceptance scan budget. Beyond this window, retain the
+	// unresolved marker for inspection instead of claiming uptake.
+	sc := bufio.NewScanner(io.LimitReader(f, codexTurnGenerationScanMaxBytes))
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		var row struct {
+			Timestamp time.Time `json:"timestamp"`
+			Type      string    `json:"type"`
+			Payload   struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil || row.Type != "response_item" || row.Payload.Type != "message" || row.Payload.Role != "user" || row.Timestamp.Before(m.CreatedAt.Add(-2*time.Second)) {
+			continue
+		}
+		var text strings.Builder
+		for _, part := range row.Payload.Content {
+			if part.Type == "input_text" {
+				text.WriteString(part.Text)
+			}
+		}
+		if codexQueueMessageHash(text.String()) == m.QueueMessageHash {
+			return true, nil
+		}
+	}
+	return false, sc.Err()
 }

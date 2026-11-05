@@ -26,11 +26,29 @@ const landedClockSkew = 2 * time.Second
 // Rows stamped before notBefore (less a small skew) are an earlier message
 // with the same text, never this send; a zero notBefore disables the check.
 func FindLanded(ctx context.Context, harness, path string, from int64, text string, notBefore time.Time) (id, ts string, ok bool) {
-	if !SupportsDirectRows(harness) {
-		return "", "", false
-	}
 	want := normalizeLanded(text)
 	if want == "" {
+		return "", "", false
+	}
+	return findLanded(ctx, harness, path, from, notBefore, func(r *Row) bool {
+		return landedMatch(r, want)
+	})
+}
+
+// FindLandedExact uses the same scan and freshness rules as FindLanded, but
+// requires the original user text. Native queue sends preserve whitespace;
+// terminal whitespace folding and Claude paste unwrapping do not apply.
+func FindLandedExact(ctx context.Context, harness, path string, from int64, text string, notBefore time.Time) (id, ts string, ok bool) {
+	if text == "" {
+		return "", "", false
+	}
+	return findLanded(ctx, harness, path, from, notBefore, func(r *Row) bool {
+		return r.Kind == "user" && r.Body == text
+	})
+}
+
+func findLanded(ctx context.Context, harness, path string, from int64, notBefore time.Time, match func(*Row) bool) (id, ts string, ok bool) {
+	if !SupportsDirectRows(harness) {
 		return "", "", false
 	}
 	f, err := os.Open(path)
@@ -63,7 +81,7 @@ func FindLanded(ctx context.Context, harness, path string, from int64, text stri
 					id, ts, ok = fr.Row.ID, fr.Row.TS, true
 					return errStopScan
 				}
-			case fr.Frame != "row" || !landedMatch(fr.Row, want):
+			case fr.Frame != "row" || !match(fr.Row):
 			case fr.Row.Queued != nil && *fr.Row.Queued:
 				if fresh(fr.Row.TS) {
 					pending[fr.Row.ID] = true

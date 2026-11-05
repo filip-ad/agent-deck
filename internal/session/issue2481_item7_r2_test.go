@@ -326,3 +326,57 @@ func TestIssue2481R2_ConsumedDigestDoesNotWake(t *testing.T) {
 		})
 	}
 }
+
+func TestDevbox17DirectedFailureCommitBeforeWake(t *testing.T) {
+	for _, idle := range []bool{false, true} {
+		t.Run(fmt.Sprint(idle), func(t *testing.T) {
+			n, parent, ev := newWakeNudgeFixture(t)
+			sender := &Instance{ID: parent, Title: "ordinary-sender", Tool: "claude", Status: StatusIdle}
+			ev.ToStatus, ev.LastOutputHash, ev.Text = "send_failed", "send:devbox17", "send devbox17 to target failed: busy deadline"
+			sent := 0
+			n.wake = &wakeNudgeWiring{
+				nudger: NewWakeNudger(time.Minute), now: time.Now,
+				isIdle: func(target *Instance, kind string) bool { return idle && isWakeTarget(target, kind) },
+				send: func(target *Instance, profile, message string) error {
+					sent++
+					pending, err := ReadInboxEvents(parent)
+					if err != nil || len(pending) != 1 || pending[0].Text != ev.Text || pending[0].Tier != TurnTierUrgent || target.ID != parent {
+						t.Fatalf("wake preceded directed durable commit: %+v %v", pending, err)
+					}
+					return nil
+				},
+			}
+			n.commitReplyToSender(sender, ev)
+			n.commitReplyToSender(sender, ev)
+			want := 0
+			if idle {
+				want = 1
+			}
+			if sent != want {
+				t.Fatalf("wakes=%d, want %d", sent, want)
+			}
+			pending, err := ReadInboxEvents(parent)
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("pending=%+v %v", pending, err)
+			}
+		})
+	}
+}
+
+func TestDevbox17DirectedFailureCommitErrorDoesNotWake(t *testing.T) {
+	n, parent, ev := newWakeNudgeFixture(t)
+	if err := os.MkdirAll(InboxPathFor(parent), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sent := 0
+	n.wake = &wakeNudgeWiring{
+		nudger: NewWakeNudger(0), now: time.Now,
+		isIdle: func(*Instance, string) bool { return true },
+		send:   func(*Instance, string, string) error { sent++; return nil },
+	}
+	ev.ToStatus, ev.LastOutputHash = "send_failed", "send:commit-error"
+	n.commitReplyToSender(&Instance{ID: parent, Tool: "claude"}, ev)
+	if sent != 0 {
+		t.Fatalf("failed commit requested %d wakes", sent)
+	}
+}

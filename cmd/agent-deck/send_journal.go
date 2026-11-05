@@ -158,6 +158,18 @@ func loadOrCreateKey(path string) ([]byte, error) {
 	return got, nil
 }
 
+// recordQueuedNativeAttempt keeps the native route's per-attempt journal tied
+// to the original sender and send ID, just as a session-send child does.
+func recordQueuedNativeAttempt(profile string, r *sendqueue.Record, result map[string]interface{}) {
+	outcome := health.SendFailed
+	if result["delivery"] == "queued_native" || result["delivery"] == deliveryNoEvidence {
+		outcome = health.SendUnconfirmed
+	}
+	detail := map[string]any{"outcome": outcome, "delivery": result["delivery"], "transport": "codex_queue"}
+	sendJournalMeta{sender: r.Sender, textHash: sendTextHash(profile, r.Message), textLen: len(r.Message), sendID: r.SendID, attempt: r.Attempts}.addTo(detail)
+	recordSendEvent(profile, r.SessionID, detail)
+}
+
 // queuedOutcomeCancelled is the final journal outcome of a send removed by
 // `session queue cancel` before any typing: neither delivered nor failed.
 const queuedOutcomeCancelled = "cancelled"
@@ -195,6 +207,9 @@ func finishQueuedSend(profile string, r *sendqueue.Record, notify bool) {
 	ledgerQueuedSend(r, inboxOwned)
 }
 
+var failedSendNotifierOnce sync.Once
+var failedSendNotifier *session.TransitionNotifier
+
 // notifySenderOfFailedSend writes the failure into the sender session's
 // inbox (read by its prompt-time drain, `inbox peek` and the TUI like any
 // other record). Only for a sender this profile knows: a send from a plain
@@ -212,7 +227,8 @@ func notifySenderOfFailedSend(profile string, r *sendqueue.Record) bool {
 	if title == "" {
 		title = r.SessionID
 	}
-	return session.CommitToInbox(r.Sender, session.TransitionNotificationEvent{
+	failedSendNotifierOnce.Do(func() { failedSendNotifier = session.NewOneShotTransitionNotifier() })
+	return failedSendNotifier.CommitDirectedInbox(instanceByID(instances, r.Sender), session.TransitionNotificationEvent{
 		ChildSessionID: r.SessionID,
 		ChildTitle:     title,
 		Profile:        profile,
@@ -220,6 +236,6 @@ func notifySenderOfFailedSend(profile string, r *sendqueue.Record) bool {
 		ToStatus:       "send_failed",
 		Timestamp:      time.Now(),
 		LastOutputHash: "send:" + r.SendID,
-		Text:           fmt.Sprintf("Your queued send %s to '%s' was not delivered: %s. Nothing was typed, so resending is safe.", r.SendID, title, r.Reason),
+		Text:           fmt.Sprintf("Your queued send %s to '%s' failed: %s.", r.SendID, title, r.Reason),
 	}) == nil
 }

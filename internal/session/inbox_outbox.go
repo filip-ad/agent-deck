@@ -881,11 +881,24 @@ func (n *TransitionNotifier) commitReplyToSender(sender *Instance, event Transit
 	if sender == nil {
 		return
 	}
+	if err := n.CommitDirectedInbox(sender, event); err != nil {
+		commsLog.Warn("reply_commit_failed",
+			slog.String("sender", sender.ID), slog.String("child", event.ChildSessionID), slog.String("error", err.Error()))
+	}
+}
+
+// CommitDirectedInbox commits an urgent reply before requesting an idle wake.
+// A successful return means the inbox owns the notice, including a deduped
+// copy. Wake failure does not undo that ownership.
+func (n *TransitionNotifier) CommitDirectedInbox(sender *Instance, event TransitionNotificationEvent) error {
+	if sender == nil {
+		return fmt.Errorf("directed inbox target is unavailable")
+	}
 	if event.TurnFingerprint == "" {
 		event.TurnFingerprint = TurnFingerprint(event)
 	}
 	if turnAlreadyConsumed(sender.ID, event.TurnFingerprint) {
-		return
+		return nil
 	}
 	event.TargetSessionID = sender.ID
 	event.TargetKind = InboxTargetKindReply
@@ -894,16 +907,15 @@ func (n *TransitionNotifier) commitReplyToSender(sender *Instance, event Transit
 	event.DeadLetterReason = ""
 	stored, outcome, err := commitToInbox(sender.ID, event)
 	if err != nil {
-		commsLog.Warn("reply_commit_failed",
-			slog.String("sender", sender.ID), slog.String("child", event.ChildSessionID), slog.String("error", err.Error()))
-		return
+		return err
 	}
 	if outcome == inboxCommitReplaced || outcome == inboxCommitUnchanged {
 		// The same answer is already pending; do not announce a retry.
-		return
+		return nil
 	}
 	n.logEvent(event)
 	n.wakeCommittedInbox(sender, stored)
+	return nil
 }
 
 // noteCommitBackpressure logs a saturated parent inbox ONCE per child: from

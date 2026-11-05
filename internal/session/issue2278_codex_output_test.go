@@ -19,6 +19,69 @@ func isolateCodexSubmissionMarkers(t *testing.T) string {
 	return root
 }
 
+func TestDevbox17NativeQueueMarkerPreservesWhitespace(t *testing.T) {
+	isolateCodexSubmissionMarkers(t)
+	for _, tc := range []struct {
+		name, queued, other string
+	}{
+		{"spaces", "Print exactly \"a  b\"", "Print exactly \"a b\""},
+		{"tab", "Print exactly \"a\tb\"", "Print exactly \"a b\""},
+		{"newline", "Print exactly \"a\nb\"", "Print exactly \"a b\""},
+		{"blank-line", "Print exactly \"a\n\nb\"", "Print exactly \"a\nb\""},
+		{"leading", " prompt", "prompt"},
+		{"trailing", "prompt\n", "prompt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			threadID := "thread-" + tc.name
+			path := filepath.Join(t.TempDir(), "rollout-"+threadID+".jsonl")
+			appendInput := func(text string) {
+				t.Helper()
+				line, err := json.Marshal(map[string]any{"timestamp": now.Format(time.RFC3339Nano), "type": "response_item", "payload": map[string]any{"type": "message", "role": "user", "content": []map[string]string{{"type": "input_text", "text": text}}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, writeErr := f.Write(append(line, '\n'))
+				closeErr := f.Close()
+				if writeErr != nil || closeErr != nil {
+					t.Fatalf("append input: %v; close: %v", writeErr, closeErr)
+				}
+			}
+			// Even exact text before the reservation is not this send.
+			appendInput(tc.queued)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker, err := PrepareCodexSubmissionMarker("instance-whitespace", threadID, "", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := marker.PrepareQueue(CodexQueueTarget{ThreadID: threadID, Rollout: path, From: info.Size()}, tc.queued); err != nil {
+				t.Fatal(err)
+			}
+			appendInput(tc.other)
+			if _, err := ReconcileCodexSubmissionMarker(marker.InstanceID, marker.CodexSessionID, "", nil); err == nil || !strings.Contains(err.Error(), "matching input is not durable") {
+				t.Fatalf("different whitespace resolved the native marker: %v", err)
+			}
+			if saved, found, err := readCodexSubmissionMarker(marker.CodexSessionID); err != nil || !found || saved.AttemptID != marker.AttemptID {
+				t.Fatalf("unresolved marker was not retained: %+v found=%v err=%v", saved, found, err)
+			}
+			appendInput(tc.queued)
+			if _, err := ReconcileCodexSubmissionMarker(marker.InstanceID, marker.CodexSessionID, "", nil); err != nil {
+				t.Fatalf("exact later input did not resolve the native marker: %v", err)
+			}
+			if _, found, err := readCodexSubmissionMarker(marker.CodexSessionID); err != nil || found {
+				t.Fatalf("resolved marker remains: found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
 func TestCodexSubmissionMarkerIsPrivateAtomicAndContentFree(t *testing.T) {
 	isolateCodexSubmissionMarkers(t)
 	marker, err := PrepareCodexSubmissionMarker(

@@ -480,3 +480,39 @@ func (f *Filter) Consume(src []byte, armed bool, final bool) []byte {
 
 	return out
 }
+
+// XTVERSIONReplyLen recognizes only DCS >| version ST replies at the start of
+// input. It leaves other DCS strings and ordinary Alt+P input unchanged. The
+// caller must release an incomplete prefix after its finite input hold window.
+func XTVERSIONReplyLen(input []byte) (length int, incomplete bool) {
+	const prefix = "\x1bP>|"
+	if len(input) == 0 {
+		return 0, false
+	}
+	for i := 0; i < len(input) && i < len(prefix); i++ {
+		if input[i] != prefix[i] {
+			return 0, false
+		}
+	}
+	if len(input) < len(prefix) {
+		return 0, true
+	}
+	for i := len(prefix); i < len(input); i++ {
+		if i >= heldInputMaxLen {
+			return 0, false
+		}
+		if input[i] == escapeByte {
+			if i+1 == len(input) {
+				return 0, true
+			}
+			if input[i+1] == stringTerminatorByte {
+				return i + 2, false
+			}
+			return 0, false
+		}
+		if input[i] < 0x20 || input[i] > 0x7e {
+			return 0, false
+		}
+	}
+	return 0, true
+}

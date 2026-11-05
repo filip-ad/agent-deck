@@ -276,6 +276,17 @@ func NewTransitionNotifier() *TransitionNotifier {
 	return n
 }
 
+// NewOneShotTransitionNotifier keeps bounded wake dispatch in the caller's
+// lifetime. A CLI producer must finish its no-wait send child before exit;
+// daemon callers keep NewTransitionNotifier's asynchronous dispatch.
+func NewOneShotTransitionNotifier() *TransitionNotifier {
+	n := NewTransitionNotifier()
+	n.wake.send = func(parent *Instance, profile, message string) error {
+		return sendWakeNudgeNoWait(profile, parent.ID, message)
+	}
+	return n
+}
+
 // terminalDrop records a synchronously-determined terminal-undeliverable event
 // (audit B5/B9). Intentional suppressions (no_notify, self_conductor) are silent
 // and orphan is already logged once at resolve time, so those return early.

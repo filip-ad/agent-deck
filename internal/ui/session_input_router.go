@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/asheshgoplani/agent-deck/internal/termreply"
 )
 
 const (
@@ -575,6 +577,17 @@ func (r *SessionInputRouter) routeEmbeddedLocked(final bool) (toDashboard, toChi
 			break
 		}
 
+		// Filter the outer terminal's reply before the embedded generation
+		// writer sees any fragment. Paste stays opaque above. Incomplete
+		// replies share the existing 50 ms inter-byte key hold, with a
+		// 4096-byte parser limit; timeout releases the original input.
+		if replyLen, partial := termreply.XTVERSIONReplyLen(data[i:]); replyLen > 0 {
+			i += replyLen
+			continue
+		} else if partial && !final {
+			break
+		}
+
 		if detachLen := ctrlQSequenceLen(data[i:]); detachLen > 0 {
 			dashboard.WriteByte(0x11)
 			// Match the full-screen attach path: bytes coalesced after the
@@ -761,6 +774,9 @@ func isIncompleteKeySequence(data []byte) bool {
 	case 0x1b:
 		// Legacy Alt+<key>: ESC followed by the key's own sequence.
 		return isIncompleteKeySequence(data[1:])
+	case 'P':
+		_, incomplete := termreply.XTVERSIONReplyLen(data)
+		return incomplete
 	case 'O':
 		return len(data) == 2
 	case '[':
