@@ -177,9 +177,9 @@ func queuedOutcome(r *sendqueue.Record) string {
 
 // finishQueuedSend runs once when a queued send becomes final. It journals
 // one terminal record for the send_id (detail.final = true; the per-attempt
-// records stay as they were), and, when notify is set and the send failed,
-// puts a notice in the sender's inbox: the sender exited 0 with "queued"
-// long ago, so this is how it learns the message never arrived.
+// records stay as they were). A terminal failure or typed-not-submitted
+// result also notifies a known agent sender when notify is set. The sender
+// already returned from queueing, so it needs this later outcome.
 func finishQueuedSend(profile string, r *sendqueue.Record, notify bool) {
 	detail := map[string]any{
 		"outcome": queuedOutcome(r), "delivery": r.State, "final": true,
@@ -191,35 +191,55 @@ func finishQueuedSend(profile string, r *sendqueue.Record, notify bool) {
 		detail["sender"] = "unknown"
 	}
 	recordSendEvent(profile, r.SessionID, detail)
-	inboxOwned := notify && r.State == sendqueue.StateFailed && notifySenderOfFailedSend(profile, r)
+	inboxOwned := notify && notifySenderOfFailedSend(profile, r)
 	ledgerQueuedSend(r, inboxOwned)
 }
 
-// notifySenderOfFailedSend writes the failure into the sender session's
-// inbox (read by its prompt-time drain, `inbox peek` and the TUI like any
-// other record). Only for a sender this profile knows: a send from a plain
-// shell ("cli") or an unknown id would only strand an inbox nobody drains.
-// True means the inbox durably owns notification; false keeps ledger fallback.
+// notifySenderOfFailedSend reports terminal send failures to a known agent.
+// A failed record guarantees no typing; a typed-not-submitted record does not
+// permit automatic resend. Plain shells and unknown senders keep ledger fallback.
+// True means the inbox durably owns the notice, not that its wake was delivered.
 func notifySenderOfFailedSend(profile string, r *sendqueue.Record) bool {
 	if r.Sender == "" || r.Sender == sendSenderCLI {
-		return false
-	}
-	_, instances, _, err := loadSessionData(profile)
-	if err != nil || instanceByID(instances, r.Sender) == nil {
 		return false
 	}
 	title := r.SessionTitle
 	if title == "" {
 		title = r.SessionID
 	}
-	return session.CommitToInbox(r.Sender, session.TransitionNotificationEvent{
+	status, text := "", ""
+	switch {
+	case r.State == sendqueue.StateFailed:
+		status = "send_failed"
+		text = fmt.Sprintf("Your queued send %s to '%s' was not delivered: %s. Nothing was typed, so resending is safe.", r.SendID, title, r.Reason)
+	case r.State == sendqueue.StateTyped && r.Final() && r.DeliveryEvidence["delivery"] == deliveryTypedNotSubmitted:
+		status = "send_typed_not_submitted"
+		text = fmt.Sprintf("Your queued send %s to '%s' was typed, but submission was not confirmed: %s. Do not resend automatically. Check session send-status %s and the receiver before retrying.", r.SendID, title, r.Reason, r.SendID)
+	default:
+		return false
+	}
+	profile, err := session.ResolveProfileForStorage(profile)
+	if err != nil {
+		return false
+	}
+	storage, instances, _, err := loadSessionData(profile)
+	if err != nil {
+		return false
+	}
+	defer storage.Close()
+	sender := instanceByID(instances, r.Sender)
+	if sender == nil || !(session.IsClaudeCompatible(sender.Tool) || session.IsCodexCompatible(sender.Tool)) {
+		return false
+	}
+	return session.CommitInboxNotification(sender, session.TransitionNotificationEvent{
 		ChildSessionID: r.SessionID,
 		ChildTitle:     title,
 		Profile:        profile,
 		FromStatus:     "queued",
-		ToStatus:       "send_failed",
+		ToStatus:       status,
+		Tier:           session.TurnTierUrgent,
 		Timestamp:      time.Now(),
 		LastOutputHash: "send:" + r.SendID,
-		Text:           fmt.Sprintf("Your queued send %s to '%s' was not delivered: %s. Nothing was typed, so resending is safe.", r.SendID, title, r.Reason),
+		Text:           text,
 	}) == nil
 }

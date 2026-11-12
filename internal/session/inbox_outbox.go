@@ -858,7 +858,7 @@ func (n *TransitionNotifier) commitParentlessEvent(event TransitionNotificationE
 // wakes it as a reply target whatever its title, as a sibling sender would be.
 // A plain answer is info and wakes nobody; the parent reads it at its next
 // prompt. Only a Claude-compatible parent qualifies (the reply gate requires
-// it); any other parent keeps the conductor-only gate. The committed record
+// it); other records use the agent-parent gate. The committed record
 // keeps TargetKind "parent".
 func parentWakeEvent(event TransitionNotificationEvent, parent *Instance) TransitionNotificationEvent {
 	if eventAnswersSend(event) && parent != nil &&

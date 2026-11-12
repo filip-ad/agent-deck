@@ -2,38 +2,26 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
 )
 
-// Issue #1225 Tier-2 WIRING. inbox_nudge.go holds the platform-independent
-// policy core (WakeNudger: debounced, idle-only, best-effort). This file wires
-// it into the live producer commit path so an IDLE conductor is woken to drain
-// the MOMENT a completion durably lands — instead of waiting up to ~14 min for
-// its next heartbeat. The trigger is event-driven (fired synchronously from the
-// commit chokepoint, commitEventToInbox), NOT a poll loop.
-//
-// Everything here is best-effort: a nil wiring, a busy/non-conductor parent, or
-// a failed send is harmless because the durable record is still drained on the
-// parent's next Stop/heartbeat. Wake ≠ deliver.
+// Inbox records are durable; wakes are best-effort attempts to start a turn.
+// Claude drains through its hooks. Codex must run inbox drain explicitly.
+// Busy targets keep their records for the daemon's bounded retry pass.
 
-// defaultWakeNudgeDebounce bounds how often a single idle parent is woken by a
-// write-triggered nudge. A burst of N children completing near-simultaneously
-// collapses to ONE wake; the parent's Stop-hook drain then consumes every
-// pending record in that single woken turn, so a suppressed nudge loses no
-// delivery. The window NEVER delays the FIRST completion (Nudge sends the first
-// and only debounces subsequent ones), so it adds zero latency to the common
-// single-completion case. ~500ms is the audit-fleet sweet spot: long enough to
-// kill a thundering-herd of send-keys, short enough to be imperceptible — and
-// well under the ~100-300ms Claude pane-pickup cost that dominates real latency.
+// Collapse a burst of child completions into one immediate wake. The turn
+// drains all pending records; the daemon retries records that remain pending.
 const defaultWakeNudgeDebounce = 500 * time.Millisecond
 
-// wakeNudgeMessage is the prompt fired into an idle conductor's pane to wake it.
-// The content does not affect delivery — taking ANY turn runs the conductor's
-// Stop-hook drain, which is what actually consumes the durable inbox. The text
-// only tells the conductor WHY it woke so it acts on the queue immediately.
+// Pending records may outlive a failed or busy wake attempt. Retry at most
+// twice a minute per profile/parent in this daemon, until they are consumed.
+const wakeNudgeRetryInterval = 30 * time.Second
+
+// wakeNudgeMessage is the fallback instruction for an idle agent parent.
 const wakeNudgeMessage = "[INBOX] A child just committed a completion to your inbox — drain it and act on each item now."
 
 // wakeNudgeWiring carries the platform hooks the Tier-2 wake-nudge needs. It is
@@ -48,7 +36,7 @@ type wakeNudgeWiring struct {
 }
 
 // defaultWakeNudgeWiring is the production wiring: a debounced nudger, the wall
-// clock, the conductor-scoped idle probe, and a best-effort non-blocking pane
+// clock, the agent-scoped idle probe, and a best-effort non-blocking pane
 // send.
 func defaultWakeNudgeWiring() *wakeNudgeWiring {
 	return &wakeNudgeWiring{
@@ -59,10 +47,7 @@ func defaultWakeNudgeWiring() *wakeNudgeWiring {
 	}
 }
 
-// nudge runs one debounced, idle-gated wake send of message to parent through
-// the wiring's injected clock, idle probe and sender. targetKind is the
-// record's TargetKind ("parent" or "reply"); the idle gate admits a
-// non-conductor target only for a reply.
+// nudge runs one debounced, idle-gated wake through the injected hooks.
 func (w *wakeNudgeWiring) nudge(parent *Instance, targetKind, profile, message string) (bool, error) {
 	now := time.Now()
 	if w.now != nil {
@@ -75,12 +60,42 @@ func (w *wakeNudgeWiring) nudge(parent *Instance, targetKind, profile, message s
 		}
 		return w.send(parent, profile, message)
 	}
-	return w.nudger.Nudge(parent.ID, now, isIdle, send)
+	return w.nudger.Nudge(wakeNudgeKey(profile, parent.ID), now, isIdle, send)
+}
+
+// CommitInboxNotification writes a notice for a known agent and attempts an
+// idle wake. A duplicate or consumed notice causes no extra wake. A busy or
+// failed wake leaves the durable record for the daemon's retry pass.
+func CommitInboxNotification(target *Instance, event TransitionNotificationEvent) error {
+	if !isWakeTarget(target, event.TargetKind) {
+		return fmt.Errorf("inbox notification target is not a supported agent")
+	}
+	profile, err := ResolveProfileForStorage(event.Profile)
+	if err != nil {
+		return err
+	}
+	event.Profile = profile
+	event.TargetSessionID = target.ID
+	if event.TurnFingerprint == "" {
+		event.TurnFingerprint = TurnFingerprint(event)
+	}
+	if turnAlreadyConsumed(target.ID, event.TurnFingerprint) || pendingSameRecord(target.ID, event) {
+		return nil
+	}
+	stored, outcome, err := commitToInbox(target.ID, event)
+	if err != nil {
+		return err
+	}
+	if outcome != inboxCommitUnchanged {
+		n := &TransitionNotifier{wake: defaultWakeNudgeWiring()}
+		n.wakeCommittedInbox(target, stored)
+	}
+	return nil
 }
 
 // fireWakeNudge invokes the Tier-2 wake-nudge for a parent that just had a
 // completion durably committed. It is best-effort and MUST NOT affect the commit
-// result: a nil wiring, a non-conductor/busy parent, or a send error are all
+// result: a nil wiring, an unsupported/busy target, or a send error are all
 // swallowed (the durable record still drains on the next turn/heartbeat). A
 // panic in the injected probe/send is recovered so a wake bug can never take
 // down the producer.
@@ -99,7 +114,7 @@ func (n *TransitionNotifier) fireWakeNudge(parent *Instance, event TransitionNot
 	// Issue #2469: the wake line names the record it is for; the record
 	// itself (text included) is injected by the parent's prompt-time drain
 	// into the turn this line starts.
-	line := NudgeHeadline(event)
+	line := inboxWakeMessage(parent, NudgeHeadline(event))
 	sent, err := w.nudge(parent, event.TargetKind, event.Profile, line)
 	if err != nil {
 		// Best-effort: a failed wake is harmless. Log once at debug-ish level so
@@ -115,24 +130,9 @@ func (n *TransitionNotifier) fireWakeNudge(parent *Instance, event TransitionNot
 	}
 }
 
-// parentIsNudgeableIdle reports whether parent is safe to wake with a send-keys
-// nudge: it must be a conductor (only conductors drain an inbox on Stop, so a
-// nudge to a non-conductor leaf would be pure noise) AND currently idle/waiting,
-// NOT mid-turn. A "reply" target (comms redesign PR5) is the session whose
-// tagged send the child just answered (a sibling sender, or the child's own
-// parent when it asked; see parentWakeEvent): it asked, so it is woken
-// whatever its title, but only when it is Claude-compatible (its prompt-time
-// drain injects the reply). A send-keys into a RUNNING pane only queues the
-// keystroke (issue #36326) — the exact failure the pull model was built to avoid — so a
-// busy conductor is left to drain at its own turn boundary.
-//
-// The status is re-probed here, under the daemon's probe budget, through the
-// same source the sync pass uses (hook-driven state first, pane fallback).
-// Review round 2 (P2-D): the liveness gate that used to UpdateStatus() the
-// parent on the commit path is gone, so without this probe the gate read the
-// registry row as last persisted: a stale `running` withheld the wake and the
-// completion waited for the next heartbeat. A probe that overruns the budget
-// counts as not idle (the record still drains on the parent's next turn).
+// parentIsNudgeableIdle admits Claude/Codex agents at an idle or waiting
+// prompt, regardless of title. Re-probe status within the daemon's budget;
+// never type a wake into a shell or a pane known to be busy.
 func parentIsNudgeableIdle(parent *Instance, targetKind string) bool {
 	if parent == nil || !isWakeTarget(parent, targetKind) {
 		return false
@@ -148,18 +148,44 @@ func parentIsNudgeableIdle(parent *Instance, targetKind string) bool {
 	}
 }
 
-// isWakeTarget reports whether target may be woken at all for a record of
-// targetKind. A reply wake is typed into the pane and carries the child's
-// text: only a Claude-compatible pane drains it at prompt time, and a shell
-// would execute it. Any other record wakes only a conductor.
+// isWakeTarget admits agent parents independent of title. Sibling reply
+// routing keeps its existing Claude-only capability gate.
 func isWakeTarget(target *Instance, targetKind string) bool {
+	if target == nil {
+		return false
+	}
 	if targetKind == InboxTargetKindReply {
 		return IsClaudeCompatible(target.Tool)
 	}
-	return isConductorSession(target)
+	return IsClaudeCompatible(target.Tool) || IsCodexCompatible(target.Tool)
 }
 
-// sendWakeNudge fires one best-effort wake into the parent conductor's pane and
+func wakeNudgeKey(profile, targetID string) string {
+	return profile + "\x00" + targetID
+}
+
+func (w *wakeNudgeWiring) retryDue(profile, targetID string) bool {
+	if w == nil || w.nudger == nil {
+		return false
+	}
+	now := time.Now()
+	if w.now != nil {
+		now = w.now()
+	}
+	return !w.nudger.recent(wakeNudgeKey(profile, targetID), now, wakeNudgeRetryInterval)
+}
+
+// Codex has no prompt-time injection hook. Give it the command that reads the
+// actual records instead of claiming they are already in the turn's context.
+func inboxWakeMessage(target *Instance, message string) string {
+	if target != nil && IsCodexCompatible(target.Tool) {
+		message = strings.TrimSuffix(message, " · details are in this turn's context")
+		return CapTurnText(message, 160) + " · run agent-deck inbox drain self --json and act on each item now"
+	}
+	return message
+}
+
+// sendWakeNudge fires one best-effort wake into the agent parent's pane and
 // returns immediately. The actual `session send --no-wait` runs detached so a
 // slow/stuck send never blocks the producer commit path; the gate that this is
 // only reached for an IDLE pane means the send won't sit in tmux's busy-queue.
@@ -188,6 +214,7 @@ func (n *TransitionNotifier) fireDigestNudge(parent *Instance, profile, message 
 	if w == nil || w.nudger == nil || parent == nil {
 		return false
 	}
+	message = inboxWakeMessage(parent, message)
 	sent, err := w.nudge(parent, "parent", profile, message)
 	if err != nil {
 		commsLog.Warn("digest_nudge_send_failed",

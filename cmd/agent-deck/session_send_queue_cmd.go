@@ -145,7 +145,7 @@ func ledgerQueuedSend(r *sendqueue.Record, inboxOwned bool) {
 		reason = strings.TrimSpace("settled: " + reason)
 	}
 	// Use the durable queue identity, never the worker's environment.
-	if inboxOwned {
+	if inboxOwned && state == comms.StateFailed {
 		session.SpoolCommsInboxFailure(r.Sender, r.SessionID, r.SendID, "queue", reason)
 	} else {
 		session.SpoolCommsDelivery(r.Sender, r.SessionID, r.SendID, state, "queue", reason, true)
@@ -491,10 +491,11 @@ func watchQueuedSend(profile, dir, sendID string) {
 type childOutcome int
 
 const (
-	childTyped     childOutcome = iota // exit 0: typed, submission not confirmed
-	childSubmitted                     // exit 0 with confirmed submission
-	childNotSent                       // refused before typing: safe to retry
-	childUnknown                       // anything else: may have been typed
+	childTyped             childOutcome = iota // exit 0: typed, submission not confirmed
+	childSubmitted                             // exit 0 with confirmed submission
+	childNotSent                               // refused before typing: safe to retry
+	childUnknown                               // anything else: may have been typed
+	childTypedNotSubmitted                     // proved typed without confirmed submission; never retype
 )
 
 // notSentDeliveries are the `session send` outcomes that guarantee nothing
@@ -542,6 +543,9 @@ func classifyChild(result map[string]interface{}, code int) (childOutcome, strin
 	}
 	if delivery != "" {
 		reason = delivery + ": " + reason
+	}
+	if delivery == deliveryTypedNotSubmitted {
+		return childTypedNotSubmitted, reason
 	}
 	return childUnknown, reason
 }
@@ -863,6 +867,9 @@ func applyChildResult(rec *sendqueue.Record, result map[string]interface{}, code
 			} else {
 				r.Verdict = "unknown"
 			}
+		case childTypedNotSubmitted:
+			r.State, r.Reason, r.Verdict = sendqueue.StateTyped, reason, "unknown"
+			r.Settled = true
 		case childNotSent:
 			r.State, r.Reason, r.Verdict = sendqueue.StateQueued, "retrying: "+reason, "queued"
 			streak := r.UnavailableRefusals + 1

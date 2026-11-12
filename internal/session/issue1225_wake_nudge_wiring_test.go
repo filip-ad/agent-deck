@@ -155,29 +155,27 @@ func TestIssue1225_NudgeSendErrorIsHarmless(t *testing.T) {
 }
 
 // The PRODUCTION default wiring (not a test spy) is fully populated and routes
-// its idle probe through the conductor-scoped gate end-to-end: a conductor-
-// prefixed title is nudgeable only when idle, a busy conductor and a
-// non-conductor leaf are not. This guards against a future refactor silently
-// swapping defaultWakeNudgeWiring's isIdle for an unscoped probe.
-func TestIssue1225_DefaultWiringUsesConductorIdleGate(t *testing.T) {
+// its idle probe through the agent capability gate: an idle Claude parent is eligible,
+// while a busy agent and a shell are not. This guards against a future refactor silently
+// swapping defaultWakeNudgeWiring's isIdle for an unsafe probe.
+func TestIssue1225_DefaultWiringUsesAgentIdleGate(t *testing.T) {
 	withNoopStatusProbe(t)
 	w := defaultWakeNudgeWiring()
 	if w == nil || w.nudger == nil || w.now == nil || w.isIdle == nil || w.send == nil {
 		t.Fatalf("default wiring must populate every hook, got %+v", w)
 	}
-	if !w.isIdle(&Instance{ID: "c", Title: "conductor-x", Status: StatusIdle}, "parent") {
+	if !w.isIdle(&Instance{ID: "c", Tool: "claude", Title: "conductor-x", Status: StatusIdle}, "parent") {
 		t.Fatal("default wiring must nudge an idle conductor")
 	}
-	if w.isIdle(&Instance{ID: "c", Title: "conductor-x", Status: StatusRunning}, "parent") {
+	if w.isIdle(&Instance{ID: "c", Tool: "claude", Title: "conductor-x", Status: StatusRunning}, "parent") {
 		t.Fatal("default wiring must NOT nudge a busy conductor (send-keys would only queue)")
 	}
-	if w.isIdle(&Instance{ID: "l", Title: "worker", Status: StatusIdle}, "parent") {
-		t.Fatal("default wiring must NOT nudge a non-conductor leaf (no inbox drain → noise)")
+	if w.isIdle(&Instance{ID: "l", Tool: "shell", Title: "worker", Status: StatusIdle}, "parent") {
+		t.Fatal("default wiring must NOT nudge a shell")
 	}
 }
 
-// The production idle-probe is conductor-scoped (only conductors drain an inbox)
-// and only green when the pane is idle/waiting (not mid-turn).
+// The production idle probe admits idle/waiting agents without a title rule.
 func TestIssue1225_ParentIsNudgeableIdle(t *testing.T) {
 	withNoopStatusProbe(t)
 	cases := []struct {
@@ -188,11 +186,11 @@ func TestIssue1225_ParentIsNudgeableIdle(t *testing.T) {
 		{"conductor-x", StatusIdle, true},
 		{"conductor-x", StatusWaiting, true},
 		{"conductor-x", StatusRunning, false}, // busy: send-keys would only queue
-		{"worker", StatusIdle, false},         // non-conductor leaf: no inbox drain → noise
+		{"worker", StatusIdle, true},          // ordinary agent parent
 		{"conductor-x", StatusError, false},
 	}
 	for _, c := range cases {
-		p := &Instance{ID: "p", Title: c.title, Status: c.status}
+		p := &Instance{ID: "p", Tool: "claude", Title: c.title, Status: c.status}
 		if got := parentIsNudgeableIdle(p, "parent"); got != c.want {
 			t.Errorf("parentIsNudgeableIdle(title=%q,status=%q)=%v, want %v", c.title, c.status, got, c.want)
 		}
@@ -226,7 +224,7 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 		inst.Status = StatusIdle
 		return nil
 	}))
-	stale := &Instance{ID: "p", Title: "conductor-x", Status: StatusRunning}
+	stale := &Instance{ID: "p", Tool: "claude", Title: "conductor-x", Status: StatusRunning}
 	if !parentIsNudgeableIdle(stale, "parent") {
 		t.Fatal("a stale running row must not withhold the wake when the fresh probe says idle")
 	}
@@ -236,7 +234,7 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 		inst.Status = StatusRunning
 		return nil
 	}))
-	busy := &Instance{ID: "p", Title: "conductor-x", Status: StatusIdle}
+	busy := &Instance{ID: "p", Tool: "claude", Title: "conductor-x", Status: StatusIdle}
 	if parentIsNudgeableIdle(busy, "parent") {
 		t.Fatal("a stale idle row must not send a nudge into a pane the fresh probe reports mid-turn")
 	}
@@ -249,7 +247,7 @@ func TestWakeNudge_IdleGateUsesFreshStatus(t *testing.T) {
 		<-block
 		return nil
 	}))
-	hung := &Instance{ID: "p", Title: "conductor-x", Status: StatusIdle}
+	hung := &Instance{ID: "p", Tool: "claude", Title: "conductor-x", Status: StatusIdle}
 	start := time.Now()
 	if parentIsNudgeableIdle(hung, "parent") {
 		t.Fatal("a probe that overruns the budget must not report idle")

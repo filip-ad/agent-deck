@@ -753,6 +753,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		d.emitDoneSignals(profile, byID, hookStatuses)
 		d.lastStatus[profile] = copyStatusMap(statuses)
 		d.initialized[profile] = true
+		d.wakePendingInboxes(profile, byID, statuses)
 		return choosePollInterval(statuses)
 	}
 
@@ -790,7 +791,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// the paths above gets exactly one now.
 	d.emitCodexTurnFallbacks(profile, byID, statuses, notifyEnabled, time.Now())
 	d.emitDoneSignals(profile, byID, hookStatuses)
-	d.wakeForInfoDigests(profile, byID, statuses)
+	d.wakePendingInboxes(profile, byID, statuses)
 
 	// Last, after this pass's own sends and wakes: idle sessions on an
 	// outdated Claude/Codex build restart onto the new one ([sessions]
@@ -803,29 +804,51 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	return choosePollInterval(statuses)
 }
 
-// wakeForInfoDigests wakes an idle parent once when info records have waited
-// past [inbox] info_digest_minutes (issue #2469, design principle 4). One
-// non-consuming inbox read per parent per pass; parents are few.
-func (d *TransitionDaemon) wakeForInfoDigests(profile string, byID map[string]*Instance, statuses map[string]string) {
-	parents := map[string]bool{}
-	for _, inst := range byID {
-		if inst != nil && inst.ParentSessionID != "" {
-			parents[inst.ParentSessionID] = true
-		}
-	}
+// wakePendingInboxes retries eligible pending records for idle agents, even
+// when the owner is a sender with no children. The inbox remains the source of
+// truth. A process-local delay bounds repeat attempts; a consumed record no
+// longer wakes. Info records retain their existing digest window.
+func (d *TransitionDaemon) wakePendingInboxes(profile string, byID map[string]*Instance, statuses map[string]string) {
 	now := time.Now()
-	for parentID := range parents {
-		parent := byID[parentID]
-		if parent == nil {
-			continue
-		}
-		cfg := ResolveInboxConfigForInstance(parent)
-		window := time.Duration(cfg.GetInfoDigestMinutes()) * time.Minute
-		due, records, children := DigestDue(parentID, window, now)
-		if !due {
+	ttl := InboxTTL()
+	if d.notifier == nil {
+		return
+	}
+	for parentID, parent := range byID {
+		if !isWakeTarget(parent, "parent") {
 			continue
 		}
 		if st := normalizeStatusString(statuses[parentID]); st != string(StatusIdle) && st != string(StatusWaiting) {
+			continue
+		}
+		if !d.notifier.wake.retryDue(profile, parentID) || !InboxHasPending(parentID) {
+			continue
+		}
+		pending, err := ReadInboxEvents(parentID)
+		if err != nil {
+			continue
+		}
+		cfg := ResolveInboxConfigForInstance(parent)
+		urgent := false
+		reads := loadResultReads(parentID)
+		for _, ev := range pending {
+			if ev.Profile != profile || !cfg.WakesFor(ev.Tier) || (!ev.Timestamp.IsZero() && now.Sub(ev.Timestamp) > ttl) {
+				continue
+			}
+			if turnAlreadyConsumed(parentID, ev.TurnFingerprint) || reads.covers(ev) {
+				continue
+			}
+			d.notifier.wakeCommittedInbox(parent, ev)
+			urgent = true
+			break
+		}
+		if urgent {
+			continue
+		}
+
+		window := time.Duration(cfg.GetInfoDigestMinutes()) * time.Minute
+		due, records, children := DigestDue(parentID, window, now)
+		if !due {
 			continue
 		}
 		if d.notifier.fireDigestNudge(parent, profile, DigestNudgeMessage(records, children)) {

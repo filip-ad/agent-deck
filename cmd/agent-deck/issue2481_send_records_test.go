@@ -341,6 +341,9 @@ func TestQueuedSendFailureReachesTheSender(t *testing.T) {
 	if notice == nil {
 		t.Fatalf("sender inbox has no send_failed notice for %s: %+v", rec.SendID, inbox)
 	}
+	if !strings.Contains(notice.Text, "Nothing was typed") || !strings.Contains(notice.Text, "resending is safe") {
+		t.Fatalf("before-typing failure lost its resend distinction: %q", notice.Text)
+	}
 	spool, err := session.ReadCommsSpool(rec.SessionID)
 	if err != nil || len(spool) != 1 || spool[0].Event != "async-inbox" || spool[0].From != f.senderID {
 		t.Fatalf("ledger must reuse the committed inbox failure: %+v, %v", spool, err)

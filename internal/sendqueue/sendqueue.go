@@ -99,7 +99,8 @@ type Record struct {
 	// transcript the row landed in (#2397). Empty for other tools.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 	// Settled marks a typed/submitted send whose text was not found in the
-	// transcript within the watch window: it is never typed again.
+	// transcript within the watch window, or proved typed but not submitted:
+	// it is never typed again.
 	Settled bool `json:"settled,omitempty"`
 	// UnavailableRefusals counts consecutive refusals that said the target's
 	// Codex identity is provably unavailable; the worker fails the send once

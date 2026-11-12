@@ -53,3 +53,13 @@ func (w *WakeNudger) Nudge(parentID string, now time.Time, isIdle func() bool, s
 	}
 	return true, send()
 }
+
+// recent reports whether this process attempted a wake within window. It does
+// not claim delivery. Pending inbox records stay eligible after the window,
+// including when a detached send failed.
+func (w *WakeNudger) recent(parentID string, now time.Time, window time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	last, ok := w.last[parentID]
+	return ok && now.Sub(last) < window
+}
