@@ -498,6 +498,7 @@ type Instance struct {
 	// send queue, so it is delivered once and never lingers here.
 	// Persisted in the tool_data extras zone (queued_start.go).
 	QueuedMessage string `json:"queued_message,omitempty"`
+	WorkflowPlan  string `json:"workflow_plan,omitempty"`
 
 	// PromptSuggestions is the per-session override for Claude Code prompt
 	// suggestions: "children-off", "on" or "off"; empty means unset (profile,
@@ -1487,6 +1488,9 @@ func extractGroupPath(projectPath string) string {
 func (i *Instance) Start() (startErr error) {
 	defer func() { i.recordTelemetryStartError(startErr) }()
 	if i.leftQueue() {
+		if err := i.checkQueuedWorkflowPlan(); err != nil {
+			return err
+		}
 		defer func() {
 			if startErr == nil {
 				i.takeOffQueueAfterStart()
@@ -1883,6 +1887,9 @@ func (i *Instance) StartWithMessage(message string) (startErr error) {
 	}
 	defer func() { i.recordTelemetryStartError(startErr) }()
 	if i.leftQueue() {
+		if err := i.checkQueuedWorkflowPlan(); err != nil {
+			return err
+		}
 		defer func() {
 			if startErr == nil {
 				i.takeOffQueueAfterStart()

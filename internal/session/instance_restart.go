@@ -431,8 +431,13 @@ func (i *Instance) restartRecorded(env map[string]string, sf telemetry.Surface) 
 	// The old process's exit and the resumed one's boot are not turns: leave
 	// a token first, so the parent gets no false completion (#2792,
 	// restart_resume.go).
-	noteRestartToken(i, time.Now())
 	queued := i.leftQueue()
+	if queued {
+		if err := i.checkQueuedWorkflowPlan(); err != nil {
+			return err
+		}
+	}
+	noteRestartToken(i, time.Now())
 	fresh, hadFresh := readFreshStartToken(i.ID)
 	err := i.restart(env)
 	lost := errors.Is(err, errRestartLostSpawn)

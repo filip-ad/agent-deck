@@ -235,6 +235,9 @@ func (s *Storage) StartQueued(inst *Instance) (QueuedStart, error) {
 	if db == nil {
 		return QueuedStart{}, fmt.Errorf("storage database not initialized")
 	}
+	if err := inst.checkQueuedWorkflowPlan(); err != nil {
+		return QueuedStart{}, err
+	}
 	message, status, claimed, err := db.TakeQueued(inst.ID, inst.Tool, true)
 	if err != nil {
 		return QueuedStart{}, fmt.Errorf("claiming queued start of %s: %w", inst.Title, err)

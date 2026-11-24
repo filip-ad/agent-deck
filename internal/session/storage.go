@@ -201,6 +201,7 @@ type InstanceData struct {
 	// QueuedMessage mirrors Instance.QueuedMessage (tool_data extras zone,
 	// queued_start.go).
 	QueuedMessage string `json:"queued_message,omitempty"`
+	WorkflowPlan  string `json:"workflow_plan,omitempty"`
 
 	// PromptSuggestions mirrors Instance.PromptSuggestions (tool_data extras
 	// zone, prompt_suggestions.go).
@@ -1180,6 +1181,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// #2260: the per-session context-level override lives in the same extras
 	// zone so a restart from any process honours `session set ... context-level`.
 	toolData = WriteContextLevelToToolData(toolData, inst.ContextLevel)
+	toolData = writeToolDataString(toolData, "workflow_plan", inst.WorkflowPlan)
 	toolData = WriteQueuedMessageToToolData(toolData, inst.QueuedMessage)
 	toolData = WritePromptSuggestionsToToolData(toolData, inst.PromptSuggestions)
 	toolData = WriteWaitTimeoutToToolData(toolData, inst.WaitTimeout)
@@ -1396,6 +1398,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			WorkflowPlan:              readWorkflowPlan(r.ToolData),
 			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
 			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
 			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
@@ -1544,6 +1547,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ConductorName:             ReadConductorNameFromToolData(r.ToolData),
 			ContextLevel:              ReadContextLevelFromToolData(r.ToolData),
+			WorkflowPlan:              readWorkflowPlan(r.ToolData),
 			QueuedMessage:             ReadQueuedMessageFromToolData(r.ToolData),
 			PromptSuggestions:         ReadPromptSuggestionsFromToolData(r.ToolData),
 			WaitTimeout:               ReadWaitTimeoutFromToolData(r.ToolData),
@@ -1892,6 +1896,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
 			ConductorName:                instData.ConductorName,
 			ContextLevel:                 instData.ContextLevel,
+			WorkflowPlan:                 instData.WorkflowPlan,
 			QueuedMessage:                instData.QueuedMessage,
 			PromptSuggestions:            instData.PromptSuggestions,
 			WaitTimeout:                  instData.WaitTimeout,

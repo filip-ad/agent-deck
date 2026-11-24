@@ -11,6 +11,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
@@ -734,6 +735,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 		exitCLI(1)
 	}
 
+	workflowPlan, err := admitWorkflowLaunch(storage, instances, newInstance)
+	if err != nil {
+		out.Error(errors.Join(err, cleanupSingleWorktree()).Error(), ErrCodeInvalidOperation)
+		exitCLI(1)
+	}
+
 	var creationRollback *startupCreationRollback
 	if *startupQuery != "" {
 		creationRollback = &startupCreationRollback{
@@ -818,6 +825,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 
 		// The queued start delivers -m and seeds folder trust like the
 		// direct start below (session.Storage.StartQueued).
+		newInstance.BindQueuedWorkflowPlan(workflowPlan)
 		newInstance.MarkQueued(initialMessage)
 		// v1.9.x issue #1031: same targeted single-row pattern as the
 		// initial insert above — saveSessionData → SaveWithGroups is
@@ -1133,4 +1141,36 @@ func sendErrOrSpawnDied(sendErr error, paneGone bool, rec *session.SpawnFailureR
 		return sendErr
 	}
 	return fmt.Errorf("pane exited before delivery (reason: %s, elapsed_ms: %d); delivery did not happen", rec.Reason, rec.ElapsedMs)
+}
+
+// Use the managed caller's stored project binding, independent of the new
+// session's requested parent, command, title, or creation hints.
+func admitWorkflowLaunch(storage *session.Storage, peers []*session.Instance, child *session.Instance) (string, error) {
+	caller, unresolved := resolveAutoParentInstanceChecked(peers)
+	if caller == nil {
+		if unresolved != "" {
+			return "", fmt.Errorf("cannot verify launch caller %q", unresolved)
+		}
+		return "", nil
+	}
+	rows, err := storage.GetDB().ListSessionHints(statedb.HintScopeInstance, caller.ID)
+	if err != nil {
+		return "", fmt.Errorf("reading workflow caller binding: %w", err)
+	}
+	var project, brief string
+	for _, row := range rows {
+		switch row.Key {
+		case "workflow-project":
+			project = row.Value
+		case "workflow-brief":
+			brief = row.Value
+		}
+	}
+	if project == "" {
+		return "", nil
+	}
+	if project != caller.ProjectPath {
+		return "", fmt.Errorf("workflow project differs from registered caller directory")
+	}
+	return child.CheckWorkflowLaunch(caller, brief, peers)
 }
