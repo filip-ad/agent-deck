@@ -158,6 +158,17 @@ func loadOrCreateKey(path string) ([]byte, error) {
 	return got, nil
 }
 
+// recordQueuedNativeAttempt journals a native attempt under the original send ID.
+func recordQueuedNativeAttempt(profile string, r *sendqueue.Record, result map[string]interface{}) {
+	outcome := health.SendFailed
+	if result["delivery"] == codexQueueDelivery || result["delivery"] == deliveryNoEvidence {
+		outcome = health.SendUnconfirmed
+	}
+	detail := map[string]any{"outcome": outcome, "delivery": result["delivery"], "transport": codexQueueTransport}
+	sendJournalMeta{sender: r.Sender, textHash: sendTextHash(profile, r.Message), textLen: len(r.Message), sendID: r.SendID, attempt: r.Attempts}.addTo(detail)
+	recordSendEvent(profile, r.SessionID, detail)
+}
+
 // queuedOutcomeCancelled is the final journal outcome of a send removed by
 // `session queue cancel` before any typing: neither delivered nor failed.
 const queuedOutcomeCancelled = "cancelled"

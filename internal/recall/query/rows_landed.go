@@ -2,6 +2,9 @@ package query
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -76,6 +79,53 @@ func FindLanded(ctx context.Context, harness, path string, from int64, text stri
 		return nil
 	})
 	return id, ts, ok
+}
+
+// FindCodexLandedExact finds complete native user input after the queue's byte
+// offset. The same byte-for-byte check backs receipts and submission markers.
+func FindCodexLandedExact(ctx context.Context, path string, from int64, want [sha256.Size]byte, notBefore time.Time) (id, ts string, err error) {
+	f, err := os.Open(path) // #nosec G304 -- path is the target's exact local rollout
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", "", err
+	}
+	if from < 0 || info.Size() < from {
+		return "", "", fmt.Errorf("native Codex rollout has an invalid start offset")
+	}
+	// Read through this snapshot's end. A long turn can add more than
+	// a fixed prefix before taking up the queued input.
+	_, err = scanLines(ctx, f, from, info.Size(), func(line []byte, _ int64) error {
+		var rec map[string]json.RawMessage
+		if json.Unmarshal(line, &rec) != nil || timelineString(rec["type"]) != "response_item" {
+			return nil
+		}
+		pl := timelineObject(rec["payload"])
+		if timelineString(pl["type"]) != "message" || timelineString(pl["role"]) != "user" {
+			return nil
+		}
+		stamp := timelineString(rec["timestamp"])
+		if t, err := time.Parse(time.RFC3339Nano, stamp); err != nil || t.Before(notBefore.Add(-landedClockSkew)) {
+			return nil
+		}
+		var text strings.Builder
+		for _, part := range timelineArray(pl["content"]) {
+			block := timelineObject(part)
+			if timelineString(block["type"]) != "input_text" {
+				return nil
+			}
+			text.WriteString(timelineString(block["text"]))
+		}
+		if text.Len() == 0 || sha256.Sum256([]byte(text.String())) != want || codexBoilerplate(text.String()) {
+			return nil
+		}
+		id, ts = codexID(pl, "codex:"+stamp+":"+contentHash(string(line))), stamp
+		return errStopScan
+	})
+	return id, ts, err
 }
 
 // landedMatch reports whether a row carries the sent text.

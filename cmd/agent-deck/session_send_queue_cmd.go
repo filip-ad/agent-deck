@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -255,6 +256,9 @@ func handleSessionSendStatus(profile string, args []string) {
 	if err != nil {
 		out.Error(fmt.Sprintf("send %s: %v", fs.Arg(0), err), ErrCodeNotFound)
 		exitCLI(2)
+	}
+	if canReconcileNativeLanding(rec) {
+		rec = reconcileSettledNativeLanding(profile, dir, rec)
 	}
 	if !rec.Final() {
 		// A worker that died (reboot, kill) is restarted by any status read.
@@ -657,24 +661,33 @@ func deliverQueuedMode(profile, dir string, rec *sendqueue.Record, watch bool) {
 		}
 		stoppedPolls = 0
 		status, _ := fetchHookDrivenStatus(profile, inst.ID)
+		var native *session.CodexQueueTarget
 		if shouldWaitForIdle(inst.Tool, status) {
+			if !pastDeadline() {
+				native = queuedCodexNativeTarget(inst, rec, status, instances)
+			}
 			if pastDeadline() {
 				fail("target stayed busy past the retry budget")
 				return
 			}
-			_ = set(func(r *sendqueue.Record) { r.TargetStatus = status })
-			sleepUnlessQueueControl(dir, rec.SessionID, poll)
-			continue
+			if native == nil {
+				_ = set(func(r *sendqueue.Record) { r.TargetStatus = status })
+				sleepUnlessQueueControl(dir, rec.SessionID, poll)
+				continue
+			}
 		}
 		if processQueueControl(profile, dir, rec) {
 			continue
 		}
-		path := session.LiveTranscriptPath(inst, instances)
+		var path string
 		var from int64
-		if info, err := os.Stat(path); err == nil {
-			from = info.Size()
+		if native == nil {
+			path = session.LiveTranscriptPath(inst, instances)
+			if info, err := os.Stat(path); err == nil {
+				from = info.Size()
+			}
 		}
-		if !typeQueued(profile, dir, rec, inst, instances, status, path, from, set) {
+		if !typeQueued(profile, dir, rec, inst, instances, status, path, from, set, native) {
 			fail("cannot record the send before typing it")
 			return
 		}
@@ -732,12 +745,10 @@ func shouldWaitForIdle(tool, status string) bool {
 	return status == "" || status == "unknown" || status == "starting" || (status == "running" && !session.AcceptsInputWhileBusy(tool))
 }
 
-// typeQueued hands one queued record to a `session send` child. The record
-// is written as typing (attempts, sent_at, transcript offset) BEFORE the
-// child starts, so a worker that dies at any point after this leaves a
-// record no later worker types again. It returns false only when that
-// write failed, in which case nothing was typed.
-func typeQueued(profile, dir string, rec *sendqueue.Record, inst *session.Instance, instances []*session.Instance, status, path string, from int64, set func(func(*sendqueue.Record)) error) bool {
+// typeQueued durably claims a queued record before either transport starts.
+// A restarted worker never types a claimed record again. It returns false
+// only when the claim failed, in which case nothing was typed.
+func typeQueued(profile, dir string, rec *sendqueue.Record, inst *session.Instance, instances []*session.Instance, status, path string, from int64, set func(func(*sendqueue.Record)) error, native ...*session.CodexQueueTarget) bool {
 	// Budget gate at the typing boundary: a queued send or a released entry
 	// whose target went over an enforced cost budget while it waited fails
 	// untyped. It reuses the sessions the caller loaded for this attempt.
@@ -766,8 +777,19 @@ func typeQueued(profile, dir string, rec *sendqueue.Record, inst *session.Instan
 			// A released entry keeps the guard on any later attempt too.
 			r.RequireInputPrompt = true
 		}
+		if len(native) > 0 && native[0] != nil {
+			// A restarted watcher must still require exact input even if the
+			// worker died before applying the enqueue result.
+			r.DeliveryEvidence = map[string]interface{}{"transport": codexQueueTransport, "codex_session_id": native[0].ThreadID}
+		}
 	}); err != nil {
 		return false
+	}
+	if len(native) > 0 && native[0] != nil {
+		result, code := sendQueuedCodexNative(inst, rec, *native[0], set)
+		recordQueuedNativeAttempt(profile, rec, result)
+		applyChildResult(rec, result, code, true, set)
+		return true
 	}
 	child := sendChild
 	if status == queueReleaseStatus {
@@ -922,17 +944,30 @@ func watchLanded(profile string, rec *sendqueue.Record, set func(func(*sendqueue
 		return
 	}
 	sentAt, _ := time.Parse(time.RFC3339Nano, rec.SentAt)
+	native := isNativeCodexQueuedSend(rec)
+	var messageHash [sha256.Size]byte
+	if native {
+		messageHash = sha256.Sum256([]byte(rec.Message))
+	}
 	landBy := time.Now().Add(sendLandWindow())
 	for time.Now().Before(landBy) {
-		if rec.TranscriptPath == "" {
+		if rec.TranscriptPath == "" && !native {
 			if p := liveTranscriptForID(profile, rec.SessionID); p != "" {
 				_ = set(func(r *sendqueue.Record) { r.TranscriptPath = p })
 			}
 		}
 		if rec.TranscriptPath != "" {
-			if id, ts, ok := query.FindLanded(context.Background(), harness, rec.TranscriptPath, rec.TranscriptFrom, rec.Message, sentAt); ok {
+			var id, ts string
+			var ok bool
+			if native {
+				id, ts, _ = query.FindCodexLandedExact(context.Background(), rec.TranscriptPath, rec.TranscriptFrom, messageHash, sentAt)
+				ok = id != ""
+			} else {
+				id, ts, ok = query.FindLanded(context.Background(), harness, rec.TranscriptPath, rec.TranscriptFrom, rec.Message, sentAt)
+			}
+			if ok {
 				_ = set(func(r *sendqueue.Record) {
-					r.State, r.Reason, r.Verdict, r.LandedRowID, r.LandedAt = sendqueue.StateLanded, "", "delivered", id, ts
+					markQueuedLanded(r, id, ts)
 					if sid := claudeSessionIDFromTranscript(harness, r.TranscriptPath); sid != "" {
 						r.ClaudeSessionID = sid
 					}
@@ -949,6 +984,11 @@ func watchLanded(profile string, rec *sendqueue.Record, set func(func(*sendqueue
 		}
 		r.Settled = true
 	})
+}
+
+func markQueuedLanded(r *sendqueue.Record, id, ts string) {
+	r.State, r.Reason, r.Verdict, r.LandedRowID, r.LandedAt = sendqueue.StateLanded, "", "delivered", id, ts
+	r.Settled = false
 }
 
 // claudeSessionIDFromTranscript is the Claude conversation a transcript

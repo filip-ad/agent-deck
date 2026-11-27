@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/recall/query"
 )
 
 const (
@@ -26,7 +29,8 @@ const (
 
 // CodexSubmissionMarker is the content-free durable handoff between
 // cooperating session-send processes. It records only which acceptance fence
-// a send owns; prompts, responses, and their hashes never enter this file.
+// a send owns. For native queue sends it also records a digest and rollout
+// offset so only the exact user input can resolve the attempt.
 type CodexSubmissionMarker struct {
 	Version             int       `json:"version"`
 	InstanceID          string    `json:"instance_id"`
@@ -36,6 +40,9 @@ type CodexSubmissionMarker struct {
 	Phase               string    `json:"phase"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	QueueMessageHash    string    `json:"queue_message_hash,omitempty"`
+	QueueRollout        string    `json:"queue_rollout,omitempty"`
+	QueueFrom           int64     `json:"queue_from,omitempty"`
 }
 
 // PrepareCodexSubmissionMarker durably publishes an unresolved attempt before
@@ -75,6 +82,22 @@ func PrepareCodexSubmissionMarker(instanceID, codexSessionID, priorGeneration st
 		return nil, err
 	}
 	return marker, nil
+}
+
+// PrepareQueue binds a guarded attempt to the exact text before enqueue.
+func (m *CodexSubmissionMarker) PrepareQueue(target CodexQueueTarget, message string) error {
+	if m == nil || m.CodexSessionID != target.ThreadID {
+		return fmt.Errorf("native Codex queue marker target mismatch")
+	}
+	next := *m
+	digest := sha256.Sum256([]byte(message))
+	next.QueueMessageHash = hex.EncodeToString(digest[:])
+	next.QueueRollout, next.QueueFrom = target.Rollout, target.From
+	if err := writeCodexSubmissionMarker(&next, false); err != nil {
+		return err
+	}
+	*m = next
+	return nil
 }
 
 // MarkSubmitted records positive transport-level submission evidence. A crash
@@ -122,6 +145,7 @@ var ErrCodexGenerationUndeterminable = errors.New("current Codex turn generation
 // tookInputSince (nil for none) may instead show that the unchanged turn took
 // up user input recorded after the attempt began. Without either, delivery
 // remains unknowable and all later sends fail closed.
+// Native queue markers require the exact appended user input instead.
 //
 // currentGeneration is the instance's current accepted-turn generation, or ""
 // when the newest turn start was not found within the caller's backward-scan
@@ -139,6 +163,24 @@ func ReconcileCodexSubmissionMarker(
 	}
 	if marker.InstanceID != strings.TrimSpace(instanceID) || marker.CodexSessionID != strings.TrimSpace(codexSessionID) {
 		return "", fmt.Errorf("Codex submission marker ownership does not match this instance")
+	}
+	if marker.QueueMessageHash != "" {
+		digest, _ := hex.DecodeString(marker.QueueMessageHash) // validated when read
+		landed, _, err := query.FindCodexLandedExact(context.Background(), marker.QueueRollout, marker.QueueFrom, [sha256.Size]byte(digest), marker.CreatedAt)
+		if err != nil {
+			return "", fmt.Errorf("read exact input for native Codex queue submission %s: %w", marker.AttemptID, err)
+		}
+		if landed == "" {
+			path, pathErr := codexSubmissionMarkerPath(codexSessionID)
+			if pathErr != nil {
+				return "", pathErr
+			}
+			return "", fmt.Errorf("unresolved native Codex queue submission %s at %s: matching input is not durable; inspect the exact rollout and native queue before recovery; refusing a second send", marker.AttemptID, path)
+		}
+		if err := ClearCodexSubmissionMarker(marker); err != nil {
+			return "", err
+		}
+		return currentGeneration, nil
 	}
 	if strings.TrimSpace(currentGeneration) == "" && marker.PriorTurnGeneration != "" {
 		path, pathErr := codexSubmissionMarkerPath(codexSessionID)
@@ -369,6 +411,13 @@ func validateCodexSubmissionMarker(marker *CodexSubmissionMarker) error {
 	}
 	if err := validateCodexMarkerGeneration(marker.CodexSessionID, marker.PriorTurnGeneration, true); err != nil {
 		return err
+	}
+	if marker.QueueMessageHash != "" || marker.QueueRollout != "" || marker.QueueFrom != 0 {
+		digest, err := hex.DecodeString(marker.QueueMessageHash)
+		if err != nil || len(digest) != sha256.Size || !filepath.IsAbs(marker.QueueRollout) ||
+			!strings.HasSuffix(filepath.Base(marker.QueueRollout), "-"+marker.CodexSessionID+".jsonl") || marker.QueueFrom < 0 {
+			return fmt.Errorf("invalid native Codex queue marker")
+		}
 	}
 	switch marker.Phase {
 	case CodexSubmissionPhasePrepared, CodexSubmissionPhaseSubmitted, codexSubmissionPhaseAmbiguous:
